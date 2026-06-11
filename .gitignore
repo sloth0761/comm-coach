@@ -13,6 +13,8 @@ __pycache__/
 # Comm Coach runtime data
 data/sessions.db
 data/recordings/
+data/models/model.gguf
+
 
 # Build artifacts
 build/
