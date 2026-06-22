@@ -36,6 +36,7 @@ class MemoryEngine:
         self,
         current: AnalyticsBundle,
         transcript: str,
+        embedder=None,
     ) -> MemoryContext:
         """
         Build the structured context block that Stage 4 (coaching) receives.
@@ -45,11 +46,12 @@ class MemoryEngine:
           • Top 3 recurring insight types with session counts
           • Per-dimension trend direction over last 10 sessions
 
-        v1.5 addition: semantically similar sessions via session_embeddings.
+        v1.5 addition: semantically similar sessions via session_embeddings,
+        tagged alongside the recency-based sessions ("recent" vs "similar").
         The contract (MemoryContext) and the LLM prompt format don't change.
         """
-        recent   = self._store.recent_sessions(limit=5)
-        freqs    = self._store.insight_frequencies()
+        recent = self._store.recent_sessions(limit=5)
+        freqs  = self._store.insight_frequencies()
 
         # Pre-render top 3 patterns for the prompt
         recurring: tuple[str, ...] = tuple(
@@ -65,7 +67,23 @@ class MemoryEngine:
             for dim in Dimension
         }
 
-        rendered = _render_prompt_block(transcript, current, recent, recurring, trends)
+        # v1.5 — semantic retrieval
+        semantic_ids: list[int] = []
+        if embedder is not None:
+            try:
+                semantic_ids = self._semantic_sessions(transcript, embedder, limit=2)
+            except Exception as exc:
+                logger.warning("Semantic retrieval failed (%s). Recency fallback.", exc)
+
+        recent_ids = [r["id"] for r in recent]
+        tagged: list[tuple[dict, str]] = [(r, "recent") for r in recent[:3]]
+        for sid in semantic_ids:
+            if sid not in recent_ids:
+                match = next((s for s in self._store.recent_sessions(limit=500) if s["id"] == sid), None)
+                if match:
+                    tagged.append((match, "similar"))
+
+        rendered = _render_prompt_block(current, tagged, recurring, trends, transcript)
 
         return MemoryContext(
             recent_sessions=tuple(recent),
@@ -73,6 +91,24 @@ class MemoryEngine:
             trends=trends,
             rendered=rendered,
         )
+
+    # ------------------------------------------------------------------
+    # Semantic retrieval — v1.5
+    # ------------------------------------------------------------------
+
+    def _semantic_sessions(self, transcript: str, embedder, limit: int = 2) -> list[int]:
+        """Returns up to `limit` session_ids ranked by cosine similarity to transcript."""
+        import numpy as np
+        stored = self._store.all_embeddings()
+        if not stored:
+            return []
+        query_vec = embedder.embed(transcript)
+        matrix    = np.stack([r["embedding"] for r in stored])
+        scores    = matrix @ query_vec
+        result = []
+        for i in np.argsort(scores)[::-1][:limit]:
+            result.append(stored[int(i)]["session_id"])
+        return result
 
     # ------------------------------------------------------------------
     # Communication Profile
@@ -166,15 +202,20 @@ def _compute_trend(series: list[float]) -> str:
 
 
 def _render_prompt_block(
-    transcript: str,
     current: AnalyticsBundle,
-    recent: list[dict],
+    tagged_sessions: list[tuple[dict, str]],
     recurring: tuple[str, ...],
     trends: dict[str, str],
+    transcript: str,
 ) -> str:
     """
     Render the structured context string passed to the LLM (PRD §9).
     Transcript is hard-capped at _TRANSCRIPT_MAX_CHARS characters.
+
+    v1.5: `tagged_sessions` replaces the plain `recent` list — each entry is
+    tagged "recent" or "similar" (semantic retrieval). CURRENT SCORES is
+    still rendered from `current` so the coach always sees this session's
+    own dimension scores, even though history is now similarity-aware.
     """
     score = {d.dimension: d.score for d in current.dimensions}
     lines: list[str] = []
@@ -193,27 +234,29 @@ def _render_prompt_block(
     )
     lines.append("")
 
-    if recent:
-        lines.append(f"HISTORY (last {len(recent)} sessions)")
-        for s in recent:
-            lines.append(
-                f"{s.get('created_at', 'unknown')}: "
-                f"{s.get('word_count', 0)} words, "
-                f"{s.get('speaking_rate_wpm', 0):.0f} WPM | "
-                f"Fluency {s.get('fluency') or 0:.0f}, "
-                f"Clarity {s.get('clarity') or 0:.0f}, "
-                f"Expression {s.get('expression') or 0:.0f}, "
-                f"SSC {s.get('ssc') or 0:.0f}, "
-                f"Conciseness {s.get('conciseness') or 0:.0f}"
-            )
+    if tagged_sessions:
+        lines.append("HISTORY")
+        for sess, tag in tagged_sessions:
+            date = str(sess.get("created_at", ""))[:10]
+            wc   = sess.get("word_count", 0)
+            wpm  = sess.get("speaking_rate_wpm", 0.0) or 0.0
+            f    = sess.get("fluency",    0.0) or 0.0
+            c    = sess.get("clarity",    0.0) or 0.0
+            e    = sess.get("expression", 0.0) or 0.0
+            ssc  = sess.get("ssc",        0.0) or 0.0
+            con  = sess.get("conciseness",0.0) or 0.0
+            lines.append(f"{date} [{tag}]: {wc} words, {wpm:.0f} WPM | "
+                         f"F {f:.0f} Cl {c:.0f} Ex {e:.0f} SSC {ssc:.0f} Con {con:.0f}")
+        lines.append("")
+
+    if recurring:
+        lines.append("PATTERNS")
+        lines.extend(f"- {p}" for p in recurring)
         lines.append("")
 
     non_stable = [(d, v) for d, v in trends.items() if v != "stable"]
-    if recurring or non_stable:
-        lines.append("RECURRING PATTERNS")
-        for pattern in recurring:
-            lines.append(f"- {pattern}")
-        for dim, direction in non_stable:
-            lines.append(f"- {dim} trend: {direction}")
+    if non_stable:
+        lines.append("TRENDS")
+        lines.extend(f"- {d}: {v}" for d, v in non_stable)
 
     return "\n".join(lines)

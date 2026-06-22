@@ -39,3 +39,14 @@ LLAMA_MODEL_PATH  = os.getenv("LLAMA_MODEL_PATH", str(MODELS_DIR / "model.gguf")
 
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# ---------------------------------------------------------------------------
+# v1.5 — semantic embeddings
+# ---------------------------------------------------------------------------
+
+EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL",   "all-MiniLM-L6-v2")
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "local")
+
+# keep v1 env-var name working
+LLM_MODEL_PATH = LLAMA_MODEL_PATH
+LLM_N_CTX      = int(os.getenv("LLM_N_CTX", "4096"))

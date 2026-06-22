@@ -1,1409 +1,483 @@
 """
 ui/app.py
 
-Main application window.
+Main application window (v1.5).
 """
-
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QHBoxLayout,
-    QTabWidget,
-    QMessageBox,
-    QTextEdit,
-    QScrollArea,
-    QTableWidget,
-    QTableWidgetItem,
-    QFrame,
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QMainWindow, QPushButton, QSizePolicy, QStackedWidget, QStatusBar,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
-from core.contracts import (
-    Dimension,
-)
+from core.contracts import Dimension, SessionResult
+from ui.charts import TrendDashboard, score_colour
+from ui.transcript_view import TranscriptView
 
-from core.recorder import RecorderError
-
-from ui.theme import score_colour
-from ui.widgets import (
-    PipelineWorker,
-    PlaceholderWidget,
-    ScoreCard,
-    OverallScoreCard,
-    MetricRow,
-    TagLabel,
-    CalloutBox,
-    FocusBox,
-)
+logger = logging.getLogger(__name__)
 
 
-IDLE = "idle"
-RECORDING = "recording"
-PROCESSING = "processing"
+class PipelineWorker(QThread):
+    stage_changed = pyqtSignal(str)
+    finished_ok   = pyqtSignal(object)
+    failed        = pyqtSignal(str)
 
+    def __init__(self, pipeline, recording):
+        super().__init__()
+        self._pipeline  = pipeline
+        self._recording = recording
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-
-def trend_text(value: str) -> str:
-    if value == "improving":
-        return "↑ improving"
-
-    if value == "declining":
-        return "↓ declining"
-
-    return "→ stable"
-
-
-def trend_colour(value: str) -> str:
-    if value == "improving":
-        return "#4CAF50"
-
-    if value == "declining":
-        return "#F44336"
-
-    return "#666666"
-
-
-# ------------------------------------------------------------------
-# Main Window
-# ------------------------------------------------------------------
+    def run(self):
+        self._pipeline.set_on_stage(lambda s: self.stage_changed.emit(s.value))
+        try:
+            self.finished_ok.emit(self._pipeline.run(self._recording))
+        except Exception as exc:
+            logger.exception("Pipeline error")
+            self.failed.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
-    def __init__(
-        self,
-        pipeline,
-        recorder,
-        store,
-    ):
+    def __init__(self, pipeline, store):
         super().__init__()
-
-        self.pipeline = pipeline
-        self.recorder = recorder
-        self.store = store
-
-        self.worker = None
-        self.current_result = None
-
-        self.state = IDLE
-
-        self.timer = QTimer(self)
-        self.timer.setInterval(1000)
-        self.timer.timeout.connect(
-            self._update_elapsed_time
-        )
-
+        self._dim_widgets: dict = {}
+        self._pipeline = pipeline
+        self._store    = store
+        self._recorder = None
+        self._worker   = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._tick_elapsed)
         self.setWindowTitle("Comm Coach")
-        self.setMinimumSize(900, 700)
-
-        self._build_ui()
-
-        self.refresh_session_count()
+        self.setMinimumSize(960, 700)
+        self._setup_ui()
         self.refresh_history()
 
-        if self.store.session_count() > 0:
-            self.enable_result_tabs()
+    # ── UI setup ──────────────────────────────────────────────────────────
 
-        else:
-            self.disable_result_tabs()
-
-        self.statusBar().showMessage("Ready")
-
-    # ----------------------------------------------------------
-    # UI Construction
-    # ----------------------------------------------------------
-
-    def _build_ui(self):
-
+    def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-
         root = QVBoxLayout(central)
-
-        root.addLayout(self._build_header())
-        root.addLayout(self._build_record_area())
-
-        self.tabs = QTabWidget()
-
-        root.addWidget(self.tabs)
-
-        self._build_overview_tab()
-        self._build_fluency_tab()
-        self._build_clarity_tab()
-        self._build_expression_tab()
-        self._build_ssc_tab()
-        self._build_conciseness_tab()
-        self._build_history_tab()
-        self._build_profile_tab()
-
-    # ----------------------------------------------------------
-    # Header
-    # ----------------------------------------------------------
+        root.setSpacing(0)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self._build_header())
+        root.addWidget(self._build_record_bar())
+        root.addWidget(self._build_tabs(), stretch=1)
+        self._status_bar = QStatusBar()
+        self.setStatusBar(self._status_bar)
+        self._status_bar.showMessage("Ready")
 
     def _build_header(self):
-
-        layout = QHBoxLayout()
-
+        w = QWidget()
+        w.setObjectName("Header")
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(16, 8, 16, 8)
         title = QLabel("Comm Coach")
-        title.setObjectName("HeaderTitle")
+        title.setStyleSheet("color:white;font-size:18px;font-weight:700;")
+        lay.addWidget(title)
+        lay.addStretch()
+        self._session_count_label = QLabel(self._session_count_text())
+        self._session_count_label.setStyleSheet("color:rgba(255,255,255,0.8);font-size:12px;")
+        lay.addWidget(self._session_count_label)
+        return w
 
-        self.session_count_label = QLabel("0 sessions")
+    def _build_record_bar(self):
+        w = QWidget()
+        w.setObjectName("RecordBar")
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(24, 14, 24, 14)
+        self._record_stack = QStackedWidget()
+        self._record_stack.setFixedHeight(64)
 
-        layout.addWidget(title)
-        layout.addStretch()
-        layout.addWidget(self.session_count_label)
+        # page 0 — idle
+        idle = QWidget()
+        il = QHBoxLayout(idle)
+        il.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._start_btn = QPushButton("● Start Recording")
+        self._start_btn.setObjectName("RecordButton")
+        self._start_btn.clicked.connect(self.start_recording)
+        il.addWidget(self._start_btn)
+        self._record_stack.addWidget(idle)
 
-        return layout
+        # page 1 — recording
+        rec = QWidget()
+        rl = QHBoxLayout(rec)
+        rl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rl.setSpacing(20)
+        self._elapsed_label = QLabel("0:00")
+        self._elapsed_label.setStyleSheet("font-size:22px;font-weight:700;color:#C62828;")
+        self._stop_btn = QPushButton("■ Stop Recording")
+        self._stop_btn.setObjectName("RecordButton")
+        self._stop_btn.clicked.connect(self.stop_recording)
+        rl.addWidget(self._elapsed_label)
+        rl.addWidget(self._stop_btn)
+        self._record_stack.addWidget(rec)
 
-    # ----------------------------------------------------------
-    # Record Area
-    # ----------------------------------------------------------
+        # page 2 — processing
+        proc = QWidget()
+        pl = QHBoxLayout(proc)
+        pl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._proc_label = QLabel("Processing…")
+        self._proc_label.setStyleSheet("font-size:14px;color:#546E7A;")
+        pl.addWidget(self._proc_label)
+        self._record_stack.addWidget(proc)
 
-    def _build_record_area(self):
+        outer.addWidget(self._record_stack)
+        return w
 
-        layout = QVBoxLayout()
+    def _build_tabs(self):
+        self._tabs = QTabWidget()
+        self._tabs.setDocumentMode(True)
+        self._tabs.addTab(self._build_overview_tab(),                         "Overview")
+        self._tabs.addTab(self._build_dim_tab(Dimension.FLUENCY),             "Fluency")
+        self._tabs.addTab(self._build_dim_tab(Dimension.CLARITY),             "Clarity")
+        self._tabs.addTab(self._build_dim_tab(Dimension.EXPRESSION),          "Expression")
+        self._tabs.addTab(self._build_dim_tab(Dimension.SPEECH_SIGNAL_CLARITY),"Signal Clarity")
+        self._tabs.addTab(self._build_dim_tab(Dimension.CONCISENESS),         "Conciseness")
+        self._tabs.addTab(self._build_transcript_tab(),                        "Transcript")
+        self._tabs.addTab(self._build_history_tab(),                           "History")
+        self._tabs.addTab(self._build_profile_tab(),                           "Profile")
+        return self._tabs
 
-        self.record_button = QPushButton("Record")
-        self.record_button.setObjectName(
-            "RecordButton"
-        )
-
-        self.record_button.clicked.connect(
-            self.on_record_clicked
-        )
-
-        self.elapsed_label = QLabel("00:00")
-        self.elapsed_label.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-
-        layout.addWidget(
-            self.record_button,
-            alignment=Qt.AlignmentFlag.AlignCenter,
-        )
-
-        layout.addWidget(
-            self.elapsed_label,
-            alignment=Qt.AlignmentFlag.AlignCenter,
-        )
-
-        return layout
-
-        # ----------------------------------------------------------
-    # Overview Tab
-    # ----------------------------------------------------------
+    # ── Tab builders ──────────────────────────────────────────────────────
 
     def _build_overview_tab(self):
-
-        self.overview_tab = QWidget()
-        self.tabs.addTab(
-            self.overview_tab,
-            "Overview",
-        )
-
-        layout = QVBoxLayout(self.overview_tab)
-
-        self.overall_score_card = OverallScoreCard()
-        layout.addWidget(self.overall_score_card)
-
-        dimension_row = QHBoxLayout()
-
-        self.dimension_cards = {}
-
-        for dimension in Dimension:
-
-            card = ScoreCard(
-                dimension.value.replace("_", " ").title()
-            )
-
-            self.dimension_cards[dimension] = card
-
-            dimension_row.addWidget(card)
-
-        layout.addLayout(dimension_row)
-
-        self.assessment_label = QLabel("")
-        self.assessment_label.setWordWrap(True)
-
-        layout.addWidget(self.assessment_label)
-
-        self.key_insight_box = CalloutBox(
-            "Key Insight"
-        )
-
-        layout.addWidget(self.key_insight_box)
-
-        self.next_focus_box = FocusBox()
-
-        layout.addWidget(self.next_focus_box)
-
-        layout.addStretch()
-
-    # ----------------------------------------------------------
-    # Fluency Tab
-    # ----------------------------------------------------------
-
-    def _build_fluency_tab(self):
-
-        self.fluency_tab = QWidget()
-
-        self.tabs.addTab(
-            self.fluency_tab,
-            "Fluency",
-        )
-
-        layout = QVBoxLayout(self.fluency_tab)
-
-        self.fluency_score = ScoreCard("Fluency")
-        layout.addWidget(self.fluency_score)
-
-        self.fluency_wpm = MetricRow(
-            "Words per minute"
-        )
-
-        self.fluency_fillers = MetricRow(
-            "Fillers per 100 words"
-        )
-
-        self.fluency_pauses = MetricRow(
-            "Pause count"
-        )
-
-        layout.addWidget(self.fluency_wpm)
-
-        note = QLabel(
-            "Optimal: 120–160 WPM"
-        )
-
-        layout.addWidget(note)
-
-        layout.addWidget(
-            self.fluency_fillers
-        )
-
-        layout.addWidget(
-            self.fluency_pauses
-        )
-
-        self.filler_tags_container = QWidget()
-        self.filler_tags_layout = QHBoxLayout(
-            self.filler_tags_container
-        )
-
-        layout.addWidget(
-            self.filler_tags_container
-        )
-
-        self.fluency_feedback = QLabel("")
-        self.fluency_feedback.setWordWrap(True)
-
-        layout.addWidget(
-            self.fluency_feedback
-        )
-
-        layout.addStretch()
-
-    # ----------------------------------------------------------
-    # Clarity Tab
-    # ----------------------------------------------------------
-
-    def _build_clarity_tab(self):
-
-        self.clarity_tab = QWidget()
-
-        self.tabs.addTab(
-            self.clarity_tab,
-            "Clarity",
-        )
-
-        layout = QVBoxLayout(self.clarity_tab)
-
-        self.clarity_score = ScoreCard(
-            "Clarity"
-        )
-
-        layout.addWidget(
-            self.clarity_score
-        )
-
-        self.clarity_sentence_count = MetricRow(
-            "Sentence count"
-        )
-
-        self.clarity_avg_sentence = MetricRow(
-            "Average sentence length"
-        )
-
-        self.clarity_topic_drift = MetricRow(
-            "Topic drift"
-        )
-
-        self.clarity_repetition = MetricRow(
-            "Repeated phrase count"
-        )
-
-        layout.addWidget(
-            self.clarity_sentence_count
-        )
-
-        layout.addWidget(
-            self.clarity_avg_sentence
-        )
-
-        layout.addWidget(
-            self.clarity_topic_drift
-        )
-
-        layout.addWidget(
-            self.clarity_repetition
-        )
-
-        self.clarity_feedback = QLabel("")
-        self.clarity_feedback.setWordWrap(True)
-
-        layout.addWidget(
-            self.clarity_feedback
-        )
-
-        layout.addStretch()
-
-    # ----------------------------------------------------------
-    # Expression Tab
-    # ----------------------------------------------------------
-
-    def _build_expression_tab(self):
-
-        self.expression_tab = QWidget()
-
-        self.tabs.addTab(
-            self.expression_tab,
-            "Expression",
-        )
-
-        layout = QVBoxLayout(
-            self.expression_tab
-        )
-
-        self.expression_score = ScoreCard(
-            "Expression"
-        )
-
-        layout.addWidget(
-            self.expression_score
-        )
-
-        self.expression_ttr = MetricRow(
-            "Vocabulary diversity"
-        )
-
-        self.expression_unique_words = MetricRow(
-            "Unique content words"
-        )
-
-        self.expression_complex_ratio = MetricRow(
-            "Complex word ratio"
-        )
-
-        self.expression_avg_length = MetricRow(
-            "Average word length"
-        )
-
-        layout.addWidget(
-            self.expression_ttr
-        )
-
-        layout.addWidget(
-            self.expression_unique_words
-        )
-
-        layout.addWidget(
-            self.expression_complex_ratio
-        )
-
-        layout.addWidget(
-            self.expression_avg_length
-        )
-
-        self.expression_feedback = QLabel("")
-        self.expression_feedback.setWordWrap(True)
-
-        layout.addWidget(
-            self.expression_feedback
-        )
-
-        layout.addStretch()
-
-    # ----------------------------------------------------------
-    # Speech Signal Clarity
-    # ----------------------------------------------------------
-
-    def _build_ssc_tab(self):
-
-        self.ssc_tab = QWidget()
-
-        self.tabs.addTab(
-            self.ssc_tab,
-            "Speech Signal Clarity",
-        )
-
-        layout = QVBoxLayout(
-            self.ssc_tab
-        )
-
-        self.ssc_score = ScoreCard(
-            "Speech Signal Clarity"
-        )
-
-        layout.addWidget(
-            self.ssc_score
-        )
-
-        self.ssc_confidence = MetricRow(
-            "Average confidence"
-        )
-
-        self.ssc_low_segments = MetricRow(
-            "Low confidence segments"
-        )
-
-        layout.addWidget(
-            self.ssc_confidence
-        )
-
-        layout.addWidget(
-            self.ssc_low_segments
-        )
-
-        self.transcript_text = QTextEdit()
-        self.transcript_text.setReadOnly(True)
-
-        layout.addWidget(
-            self.transcript_text
-        )
-
-        self.ssc_feedback = QLabel("")
-        self.ssc_feedback.setWordWrap(True)
-
-        layout.addWidget(
-            self.ssc_feedback
-        )
-
-            # ----------------------------------------------------------
-    # Conciseness Tab
-    # ----------------------------------------------------------
-
-    def _build_conciseness_tab(self):
-
-        self.conciseness_tab = QWidget()
-
-        self.tabs.addTab(
-            self.conciseness_tab,
-            "Conciseness",
-        )
-
-        layout = QVBoxLayout(
-            self.conciseness_tab
-        )
-
-        self.conciseness_score = ScoreCard(
-            "Conciseness"
-        )
-
-        layout.addWidget(
-            self.conciseness_score
-        )
-
-        self.conciseness_verbose = MetricRow(
-            "Verbose phrases found"
-        )
-
-        self.conciseness_repeated = MetricRow(
-            "Repeated ideas"
-        )
-
-        self.conciseness_density = MetricRow(
-            "Content word density"
-        )
-
-        layout.addWidget(
-            self.conciseness_verbose
-        )
-
-        layout.addWidget(
-            self.conciseness_repeated
-        )
-
-        layout.addWidget(
-            self.conciseness_density
-        )
-
-        self.conciseness_feedback = QLabel("")
-        self.conciseness_feedback.setWordWrap(True)
-
-        layout.addWidget(
-            self.conciseness_feedback
-        )
-
-        layout.addStretch()
-
-    # ----------------------------------------------------------
-    # History Tab
-    # ----------------------------------------------------------
+        page = QWidget()
+        lay  = QVBoxLayout(page)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(12)
+
+        top = QHBoxLayout()
+        self._overall_label = QLabel("—")
+        self._overall_label.setObjectName("OverallScore")
+        self._overall_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top.addStretch()
+        top.addWidget(self._overall_label)
+        stats = QVBoxLayout()
+        self._dur_lbl = QLabel("Duration: —")
+        self._wc_lbl  = QLabel("Words: —")
+        self._wpm_lbl = QLabel("WPM: —")
+        for l in (self._dur_lbl, self._wc_lbl, self._wpm_lbl):
+            l.setStyleSheet("font-size:13px;color:#546E7A;")
+            stats.addWidget(l)
+        stats.addStretch()
+        top.addLayout(stats)
+        top.addStretch()
+        lay.addLayout(top)
+
+        lay.addWidget(_hdr("Overall Assessment"))
+        self._assessment_lbl = QLabel("Record a session to see coaching feedback.")
+        self._assessment_lbl.setWordWrap(True)
+        self._assessment_lbl.setStyleSheet("font-size:13px;")
+        lay.addWidget(self._assessment_lbl)
+
+        row = QHBoxLayout()
+        ki = _infobox("Key Insight", "—")
+        self._insight_lbl = ki.findChild(QLabel, "InfoValue")
+        nf = _infobox("Next Focus", "—")
+        self._focus_lbl = nf.findChild(QLabel, "InfoValue")
+        row.addWidget(ki)
+        row.addWidget(nf)
+        lay.addLayout(row)
+
+        lay.addWidget(_hdr("Strengths"))
+        self._strengths_lbl = QLabel("—")
+        self._strengths_lbl.setWordWrap(True)
+        lay.addWidget(self._strengths_lbl)
+
+        lay.addWidget(_hdr("Improvements"))
+        self._improvements_lbl = QLabel("—")
+        self._improvements_lbl.setWordWrap(True)
+        lay.addWidget(self._improvements_lbl)
+
+        lay.addStretch()
+        return page
+
+    def _build_dim_tab(self, dim: Dimension):
+        page = QWidget()
+        lay  = QVBoxLayout(page)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+
+        score_lbl = QLabel("—")
+        score_lbl.setObjectName("DimensionScore")
+        score_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        score_lbl.setStyleSheet("font-size:36px;font-weight:700;")
+
+        feedback_lbl = QLabel("Record a session to see feedback.")
+        feedback_lbl.setWordWrap(True)
+        feedback_lbl.setStyleSheet("font-size:13px;")
+
+        metrics_lbl = QLabel("")
+        metrics_lbl.setWordWrap(True)
+        metrics_lbl.setStyleSheet("font-size:12px;color:#546E7A;")
+
+        insight_list = QListWidget()
+        insight_list.setMaximumHeight(100)
+
+        lay.addWidget(_hdr(str(dim).replace("_", " ").title()))
+        lay.addWidget(score_lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(feedback_lbl)
+        lay.addWidget(_hdr("Metrics"))
+        lay.addWidget(metrics_lbl)
+        lay.addWidget(_hdr("Insights"))
+        lay.addWidget(insight_list)
+        lay.addStretch()
+
+        self._dim_widgets[dim] = {
+            "score": score_lbl, "feedback": feedback_lbl,
+            "metrics": metrics_lbl, "insights": insight_list,
+        }
+        return page
+
+    def _build_transcript_tab(self):
+        self._transcript_view = TranscriptView()
+        return self._transcript_view
 
     def _build_history_tab(self):
+        page = QWidget()
+        lay  = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
 
-        self.history_tab = QWidget()
+        self._trend_dashboard = TrendDashboard(store=self._store)
+        lay.addWidget(self._trend_dashboard)
 
-        self.tabs.addTab(
-            self.history_tab,
-            "History",
+        self._history_table = QTableWidget()
+        self._history_table.setColumnCount(7)
+        self._history_table.setHorizontalHeaderLabels(
+            ["Date", "Duration", "Words", "WPM", "Score", "Best dim", "Weakest dim"]
         )
-
-        layout = QVBoxLayout(
-            self.history_tab
-        )
-
-        self.history_table = QTableWidget()
-
-        self.history_table.setColumnCount(5)
-
-        self.history_table.setHorizontalHeaderLabels(
-            [
-                "Date",
-                "Duration",
-                "Words",
-                "WPM",
-                "Score",
-            ]
-        )
-
-        layout.addWidget(
-            self.history_table
-        )
-
-        # v1.5: open detail view
-
-    # ----------------------------------------------------------
-    # Profile Tab
-    # ----------------------------------------------------------
+        self._history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._history_table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self._history_table)
+        return page
 
     def _build_profile_tab(self):
+        page = QWidget()
+        lay  = QVBoxLayout(page)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
 
-        self.profile_tab = QWidget()
+        self._profile_narrative = QLabel("")
+        self._profile_narrative.setObjectName("ProfileNarrative")
+        self._profile_narrative.setWordWrap(True)
+        self._profile_narrative.hide()
+        lay.addWidget(self._profile_narrative)
 
-        self.tabs.addTab(
-            self.profile_tab,
-            "Profile",
-        )
+        for attr, header in [
+            ("_profile_strengths",  "Consistent Strengths"),
+            ("_profile_weaknesses", "Recurring Challenges"),
+            ("_profile_fillers",    "Persistent Fillers"),
+        ]:
+            lay.addWidget(_hdr(header))
+            lbl = QLabel("—")
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("font-size:13px;")
+            setattr(self, attr, lbl)
+            lay.addWidget(lbl)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        lay.addWidget(_hdr("Notable Pattern"))
+        self._profile_notable = QLabel("—")
+        self._profile_notable.setWordWrap(True)
+        lay.addWidget(self._profile_notable)
 
-        container = QWidget()
-        scroll.setWidget(container)
+        lay.addWidget(_hdr("Trends"))
+        self._profile_trends = QLabel("—")
+        self._profile_trends.setWordWrap(True)
+        lay.addWidget(self._profile_trends)
 
-        self.tabs.removeTab(
-            self.tabs.indexOf(self.profile_tab)
-        )
+        lay.addStretch()
+        return page
 
-        self.tabs.addTab(
-            scroll,
-            "Profile",
-        )
-
-        layout = QVBoxLayout(container)
-
-        # Strengths
-
-        strengths_title = QLabel(
-            "Strengths"
-        )
-        strengths_title.setStyleSheet(
-            "font-weight: bold;"
-        )
-
-        self.profile_strengths = QLabel("")
-        self.profile_strengths.setWordWrap(True)
-
-        layout.addWidget(
-            strengths_title
-        )
-
-        layout.addWidget(
-            self.profile_strengths
-        )
-
-        # Weaknesses
-
-        weaknesses_title = QLabel(
-            "Recurring weaknesses"
-        )
-
-        weaknesses_title.setStyleSheet(
-            "font-weight: bold;"
-        )
-
-        self.profile_weaknesses = QLabel("")
-        self.profile_weaknesses.setWordWrap(True)
-
-        layout.addWidget(
-            weaknesses_title
-        )
-
-        layout.addWidget(
-            self.profile_weaknesses
-        )
-
-        # Trends
-
-        trends_title = QLabel(
-            "Trends"
-        )
-
-        trends_title.setStyleSheet(
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(
-            trends_title
-        )
-
-        self.trends_container = QWidget()
-        self.trends_layout = QVBoxLayout(
-            self.trends_container
-        )
-
-        layout.addWidget(
-            self.trends_container
-        )
-
-        # Fillers
-
-        fillers_title = QLabel(
-            "Persistent filler words"
-        )
-
-        fillers_title.setStyleSheet(
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(
-            fillers_title
-        )
-
-        self.profile_fillers = QLabel("")
-        self.profile_fillers.setWordWrap(True)
-
-        layout.addWidget(
-            self.profile_fillers
-        )
-
-        # Notable pattern
-
-        pattern_title = QLabel(
-            "Notable pattern"
-        )
-
-        pattern_title.setStyleSheet(
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(
-            pattern_title
-        )
-
-        self.profile_pattern = QLabel("")
-        self.profile_pattern.setWordWrap(True)
-
-        layout.addWidget(
-            self.profile_pattern
-        )
-
-        layout.addStretch()
-
-    # ----------------------------------------------------------
-    # Tab Helpers
-    # ----------------------------------------------------------
-
-    def disable_result_tabs(self):
-
-        for i in range(self.tabs.count()):
-            self.tabs.setTabEnabled(
-                i,
-                False,
-            )
-
-    def enable_result_tabs(self):
-
-        for i in range(self.tabs.count()):
-            self.tabs.setTabEnabled(
-                i,
-                True,
-            )
-
-    # ----------------------------------------------------------
-    # Header Helpers
-    # ----------------------------------------------------------
-
-    def refresh_session_count(self):
-
-        count = self.store.session_count()
-
-        self.session_count_label.setText(
-            f"{count} sessions"
-        )
-
-    # ----------------------------------------------------------
-    # History Refresh
-    # ----------------------------------------------------------
-
-    def refresh_history(self):
-
-        rows = self.store.all_sessions_summary()
-
-        self.history_table.setRowCount(
-            len(rows)
-        )
-
-        for row_idx, row in enumerate(rows):
-
-            created = row["created_at"]
-
-            if isinstance(
-                created,
-                datetime,
-            ):
-                created = created.strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-
-            values = [
-                created,
-                f'{row["duration_seconds"]:.1f}s',
-                str(row["word_count"]),
-                f'{row["speaking_rate_wpm"]:.0f}',
-                f'{row["overall_score"]:.0f}',
-            ]
-
-            for col_idx, value in enumerate(values):
-
-                self.history_table.setItem(
-                    row_idx,
-                    col_idx,
-                    QTableWidgetItem(
-                        str(value)
-                    ),
-                )
-
-        self.history_table.resizeColumnsToContents()
-
-            # ----------------------------------------------------------
-    # Recording State Machine
-    # ----------------------------------------------------------
-
-    def on_record_clicked(self):
-
-        if self.state == IDLE:
-            self.start_recording()
-            return
-
-        if self.state == RECORDING:
-            self.stop_recording()
-            return
+    # ── Recording ─────────────────────────────────────────────────────────
 
     def start_recording(self):
-
+        from core.recorder import AudioRecorder, RecorderError
+        import config
         try:
-            self.recorder.start()
-
-        except RecorderError as exc:
-
-            QMessageBox.warning(
-                self,
-                "Microphone error",
-                str(exc),
-            )
-
+            self._recorder = AudioRecorder(output_dir=str(config.RECORDINGS_DIR))
+            self._recorder.start()
+        except RecorderError as e:
+            self._status_bar.showMessage(f"Recorder error: {e}")
+            self._recorder = None
             return
-
-        self.state = RECORDING
-
-        self.record_button.setText("Stop")
-
-        self.record_button.setProperty(
-            "recording",
-            True,
-        )
-
-        self.record_button.setProperty(
-            "processing",
-            False,
-        )
-
-        self.record_button.style().unpolish(
-            self.record_button
-        )
-        self.record_button.style().polish(
-            self.record_button
-        )
-
-        self.elapsed_label.setText("00:00")
-
-        self.timer.start()
-
-        self.statusBar().showMessage(
-            "Recording..."
-        )
+        self._record_stack.setCurrentIndex(1)
+        self._elapsed_timer.start(500)
+        self._status_bar.showMessage("Recording…")
 
     def stop_recording(self):
-
-        self.timer.stop()
-
-        try:
-            recording = self.recorder.stop()
-
-        except Exception as exc:
-
-            QMessageBox.critical(
-                self,
-                "Recording error",
-                str(exc),
-            )
-
-            self.set_idle_state()
-
+        if self._recorder is None:
             return
+        self._elapsed_timer.stop()
+        recording = self._recorder.stop()
+        self._recorder = None
+        self._record_stack.setCurrentIndex(2)
+        self._proc_label.setText("Processing…")
+        self._status_bar.showMessage("Processing…")
+        self._start_pipeline(recording)
 
-        self.start_pipeline(recording)
+    def _tick_elapsed(self):
+        if self._recorder:
+            s = int(self._recorder.elapsed_seconds)
+            self._elapsed_label.setText(f"{s//60}:{s%60:02d}")
 
-    # ----------------------------------------------------------
-    # Processing State
-    # ----------------------------------------------------------
+    # ── Pipeline ──────────────────────────────────────────────────────────
 
-    def start_pipeline(self, recording):
+    def _start_pipeline(self, recording):
+        self._worker = PipelineWorker(self._pipeline, recording)
+        self._worker.stage_changed.connect(self._on_stage)
+        self._worker.finished_ok.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
 
-        self.state = PROCESSING
+    def _on_stage(self, text: str):
+        self._proc_label.setText(f"{text}…")
+        self._status_bar.showMessage(text)
 
-        self.record_button.setEnabled(False)
+    def _on_failed(self, msg: str):
+        self._record_stack.setCurrentIndex(0)
+        self._status_bar.showMessage(f"Error: {msg}")
 
-        self.record_button.setText(
-            "Processing..."
+    def _on_finished(self, result: SessionResult):
+        self._record_stack.setCurrentIndex(0)
+        self._status_bar.showMessage(
+            f"Session {result.session_id} — score {result.analytics.overall_score:.0f}/100"
         )
-
-        self.record_button.setProperty(
-            "recording",
-            False,
-        )
-
-        self.record_button.setProperty(
-            "processing",
-            True,
-        )
-
-        self.record_button.style().unpolish(
-            self.record_button
-        )
-        self.record_button.style().polish(
-            self.record_button
-        )
-
-        self.statusBar().showMessage(
-            "Starting pipeline..."
-        )
-
-        self.worker = PipelineWorker(
-            self.pipeline,
-            recording,
-        )
-
-        self.worker.stage_changed.connect(
-            self.on_stage_changed
-        )
-
-        self.worker.finished_ok.connect(
-            self.on_pipeline_finished
-        )
-
-        self.worker.failed.connect(
-            self.on_pipeline_failed
-        )
-
-        self.worker.start()
-
-    # ----------------------------------------------------------
-    # Timer
-    # ----------------------------------------------------------
-
-    def _update_elapsed_time(self):
-
-        seconds = int(
-            self.recorder.elapsed_seconds
-        )
-
-        minutes = seconds // 60
-        remaining = seconds % 60
-
-        self.elapsed_label.setText(
-            f"{minutes:02d}:{remaining:02d}"
-        )
-
-    # ----------------------------------------------------------
-    # Pipeline Signals
-    # ----------------------------------------------------------
-
-    def on_stage_changed(self, stage_text):
-
-        self.record_button.setText(
-            f"{stage_text}..."
-        )
-
-        self.statusBar().showMessage(
-            f"{stage_text}..."
-        )
-
-    def on_pipeline_failed(self, error):
-
-        QMessageBox.critical(
-            self,
-            "Pipeline error",
-            error,
-        )
-
-        self.set_idle_state()
-
-    def on_pipeline_finished(
-        self,
-        session_result,
-    ):
-
-        self.current_result = session_result
-
-        self.populate_from_result(
-            session_result
-        )
-
-        self.refresh_session_count()
+        self._populate_overview(result)
+        self._populate_dims(result)
+        self._populate_transcript(result)
+        self._populate_profile(result)
         self.refresh_history()
+        self._update_session_count()
 
-        self.enable_result_tabs()
+    # ── Populate ──────────────────────────────────────────────────────────
 
-        self.statusBar().showMessage(
-            "Ready"
+    def _populate_overview(self, r: SessionResult):
+        score = r.analytics.overall_score
+        colour = score_colour(score)
+        self._overall_label.setText(f"{score:.0f}")
+        self._overall_label.setStyleSheet(
+            f"font-size:48px;font-weight:700;color:{colour};"
         )
+        dur = r.recording.duration_seconds
+        self._dur_lbl.setText(f"Duration: {int(dur//60)}m {int(dur%60)}s")
+        self._wc_lbl.setText(f"Words: {r.transcription.word_count}")
+        self._wpm_lbl.setText(f"WPM: {r.transcription.speaking_rate_wpm:.0f}")
+        self._assessment_lbl.setText(r.coaching.overall_assessment)
+        if self._insight_lbl:
+            self._insight_lbl.setText(r.coaching.key_insight)
+        if self._focus_lbl:
+            self._focus_lbl.setText(r.coaching.next_focus)
+        self._strengths_lbl.setText("\n".join(f"✓ {s}" for s in r.coaching.strengths))
+        self._improvements_lbl.setText("\n".join(f"→ {s}" for s in r.coaching.improvements))
 
-        self.set_idle_state()
+    def _populate_dims(self, r: SessionResult):
+        for dim_result in r.analytics.dimensions:
+            w = self._dim_widgets.get(dim_result.dimension)
+            if not w:
+                continue
+            colour = score_colour(dim_result.score)
+            w["score"].setText(f"{dim_result.score:.0f}")
+            w["score"].setStyleSheet(f"font-size:36px;font-weight:700;color:{colour};")
+            w["feedback"].setText(dim_result.feedback)
+            metrics_text = "  ·  ".join(f"{k}: {v}" for k, v in dim_result.metrics.items())
+            w["metrics"].setText(metrics_text)
+            w["insights"].clear()
+            for insight in dim_result.insights:
+                w["insights"].addItem(f"{insight.insight_type}  —  {insight.value}")
 
-    # ----------------------------------------------------------
-    # Return To Idle
-    # ----------------------------------------------------------
-
-    def set_idle_state(self):
-
-        self.state = IDLE
-
-        self.record_button.setEnabled(True)
-
-        self.record_button.setText(
-            "Record"
+    def _populate_transcript(self, r: SessionResult):
+        words = self._store.session_words(r.session_id)
+        fe    = {}
+        for dim in r.analytics.dimensions:
+            if str(dim.dimension) == "fluency":
+                fe = dim.filler_events
+        segs   = self._store.session_segments(r.session_id)
+        pauses = sum(
+            1 for i in range(1, len(words))
+            if float(words[i]["start"]) - float(words[i - 1]["end"]) > 0.5
         )
-
-        self.record_button.setProperty(
-            "recording",
-            False,
-        )
-
-        self.record_button.setProperty(
-            "processing",
-            False,
-        )
-
-        self.record_button.style().unpolish(
-            self.record_button
-        )
-        self.record_button.style().polish(
-            self.record_button
-        )
-
-        self.statusBar().showMessage(
-            "Ready"
-        )
-
-            # ----------------------------------------------------------
-    # Result Population
-    # ----------------------------------------------------------
-
-    def populate_from_result(
-        self,
-        result,
-    ):
-
-        self.populate_overview(result)
-        self.populate_fluency(result)
-        self.populate_clarity(result)
-        self.populate_expression(result)
-        self.populate_ssc(result)
-        self.populate_conciseness(result)
-        self.populate_profile(result)
-
-    # ----------------------------------------------------------
-    # Overview
-    # ----------------------------------------------------------
-
-    def populate_overview(self, result):
-
-        self.overall_score_card.set_score(
-            result.analytics.overall_score
-        )
-
-        for dimension_result in result.analytics.dimensions:
-
-            card = self.dimension_cards[
-                dimension_result.dimension
-            ]
-
-            card.set_score(
-                dimension_result.score
-            )
-
-        self.assessment_label.setText(
-            result.coaching.overall_assessment
-        )
-
-        self.key_insight_box.set_text(
-            result.coaching.key_insight
-        )
-
-        self.next_focus_box.set_focus(
-            result.coaching.next_focus
-        )
-
-    # ----------------------------------------------------------
-    # Fluency
-    # ----------------------------------------------------------
-
-    def populate_fluency(self, result):
-
-        fluency = result.analytics.dimensions[0]
-
-        metrics = fluency.metrics
-
-        self.fluency_score.set_score(
-            fluency.score
-        )
-
-        self.fluency_wpm.set_value(
-            f'{metrics["wpm"]:.0f}'
-        )
-
-        self.fluency_fillers.set_value(
-            f'{metrics["filler_rate_per_100"]:.2f}'
-        )
-
-        self.fluency_pauses.set_value(
-            str(metrics["pause_count"])
-        )
-
-        while self.filler_tags_layout.count():
-
-            item = self.filler_tags_layout.takeAt(0)
-
-            widget = item.widget()
-
-            if widget:
-                widget.deleteLater()
-
-        for word, count in (
-            fluency.filler_events.items()
-        ):
-
-            self.filler_tags_layout.addWidget(
-                TagLabel(
-                    f"{word} × {count}"
-                )
-            )
-
-        self.filler_tags_layout.addStretch()
-
-        self.fluency_feedback.setText(
-            fluency.feedback
-        )
-
-    # ----------------------------------------------------------
-    # Clarity
-    # ----------------------------------------------------------
-
-    def populate_clarity(self, result):
-
-        clarity = result.analytics.dimensions[1]
-
-        metrics = clarity.metrics
-
-        self.clarity_score.set_score(
-            clarity.score
-        )
-
-        self.clarity_sentence_count.set_value(
-            str(
-                metrics[
-                    "sentence_count"
-                ]
-            )
-        )
-
-        self.clarity_avg_sentence.set_value(
-            f'{metrics["avg_sentence_length"]:.1f}'
-        )
-
-        self.clarity_topic_drift.set_value(
-            (
-                "Detected"
-                if metrics["topic_drift"]
-                else "None"
-            )
-        )
-
-        self.clarity_repetition.set_value(
-            str(
-                metrics[
-                    "repeated_phrase_count"
-                ]
-            )
-        )
-
-        self.clarity_feedback.setText(
-            clarity.feedback
-        )
-
-    # ----------------------------------------------------------
-    # Expression
-    # ----------------------------------------------------------
-
-    def populate_expression(self, result):
-
-        expression = (
-            result.analytics.dimensions[2]
-        )
-
-        metrics = expression.metrics
-
-        self.expression_score.set_score(
-            expression.score
-        )
-
-        self.expression_ttr.set_value(
-            f'{metrics["corrected_ttr"]:.1%}'
-        )
-
-        self.expression_unique_words.set_value(
-            str(
-                metrics[
-                    "unique_content_words"
-                ]
-            )
-        )
-
-        self.expression_complex_ratio.set_value(
-            f'{metrics["complex_word_ratio"]:.1%}'
-        )
-
-        self.expression_avg_length.set_value(
-            f'{metrics["avg_content_word_length"]:.2f}'
-        )
-
-        self.expression_feedback.setText(
-            expression.feedback
-        )
-
-    # ----------------------------------------------------------
-    # Speech Signal Clarity
-    # ----------------------------------------------------------
-
-    def populate_ssc(self, result):
-
-        ssc = result.analytics.dimensions[3]
-
-        metrics = ssc.metrics
-
-        self.ssc_score.set_score(
-            ssc.score
-        )
-
-        self.ssc_confidence.set_value(
-            f'{metrics["avg_confidence"]:.1%}'
-        )
-
-        self.ssc_low_segments.set_value(
-            (
-                f'{metrics["low_confidence_segments"]}'
-                f' / {metrics["segment_count"]}'
-            )
-        )
-
-        self.transcript_text.setPlainText(
-            result.transcription.text
-        )
-
-        self.ssc_feedback.setText(
-            ssc.feedback
-        )
-
-    # ----------------------------------------------------------
-    # Conciseness
-    # ----------------------------------------------------------
-
-    def populate_conciseness(self, result):
-
-        conciseness = (
-            result.analytics.dimensions[4]
-        )
-
-        metrics = conciseness.metrics
-
-        self.conciseness_score.set_score(
-            conciseness.score
-        )
-
-        self.conciseness_verbose.set_value(
-            str(
-                metrics[
-                    "verbose_phrase_count"
-                ]
-            )
-        )
-
-        self.conciseness_repeated.set_value(
-            str(
-                metrics[
-                    "repeated_idea_count"
-                ]
-            )
-        )
-
-        self.conciseness_density.set_value(
-            f'{metrics["content_word_density"]:.1%}'
-        )
-
-        self.conciseness_feedback.setText(
-            conciseness.feedback
-        )
-
-    # ----------------------------------------------------------
-    # Profile
-    # ----------------------------------------------------------
-
-    def populate_profile(self, result):
-
-        profile = result.profile
-
-        # Strengths
-
-        if profile.strengths:
-
-            self.profile_strengths.setText(
-                "\n".join(
-                    f"• {item}"
-                    for item in profile.strengths
-                )
-            )
-
+        if words:
+            self._transcript_view.populate(words, fe, len(segs), pauses)
         else:
+            self._transcript_view.populate_from_text(r.transcription.text, fe)
 
-            self.profile_strengths.setText(
-                (
-                    "Complete more sessions "
-                    "to identify strengths"
-                )
-            )
-
-        # Weaknesses
-
-        if profile.recurring_weaknesses:
-
-            self.profile_weaknesses.setText(
-                "\n".join(
-                    f"• {item}"
-                    for item in profile.recurring_weaknesses
-                )
-            )
-
+    def _populate_profile(self, r: SessionResult):
+        p = r.profile
+        if p.narrative:
+            self._profile_narrative.setText(p.narrative)
+            self._profile_narrative.show()
         else:
-
-            self.profile_weaknesses.setText(
-                (
-                    "No recurring patterns "
-                    "detected yet"
-                )
-            )
-
-        # Trends
-
-        while self.trends_layout.count():
-
-            item = self.trends_layout.takeAt(0)
-
-            widget = item.widget()
-
-            if widget:
-                widget.deleteLater()
-
-        for dimension, trend in (
-            profile.trends.items()
-        ):
-
-            label = QLabel(
-                f"{dimension} → "
-                f"{trend_text(trend)}"
-            )
-
-            label.setStyleSheet(
-                (
-                    "font-weight: bold;"
-                    f"color: {trend_colour(trend)};"
-                )
-            )
-
-            self.trends_layout.addWidget(
-                label
-            )
-
-        # Persistent Fillers
-
-        if profile.persistent_fillers:
-
-            lines = []
-
-            for item in (
-                profile.persistent_fillers
-            ):
-
-                lines.append(
-                    (
-                        f'{item["word"]}: '
-                        f'{item["sessions_with"]} sessions, '
-                        f'{item["total"]} total'
-                    )
-                )
-
-            self.profile_fillers.setText(
-                "\n".join(lines)
-            )
-
+            self._profile_narrative.hide()
+        self._profile_strengths.setText(
+            "\n".join(f"✓ {s}" for s in p.strengths) or "Keep recording to discover strengths.")
+        self._profile_weaknesses.setText(
+            "\n".join(f"→ {w}" for w in p.recurring_weaknesses) or "No recurring challenges yet.")
+        if p.persistent_fillers:
+            self._profile_fillers.setText(
+                "\n".join(f"{f['word']} — {f['total']} total, {f['sessions_with']} sessions"
+                          for f in p.persistent_fillers))
         else:
+            self._profile_fillers.setText("No persistent fillers.")
+        self._profile_notable.setText(p.notable_pattern or "—")
+        if p.trends:
+            self._profile_trends.setText(
+                "\n".join(f"{d.replace('_',' ').title()}: {t}" for d, t in p.trends.items()))
 
-            self.profile_fillers.setText(
-                "No persistent filler words yet"
-            )
+    def refresh_history(self):
+        sessions = self._store.all_sessions_summary()
+        self._history_table.setRowCount(len(sessions))
+        for row, s in enumerate(sessions):
+            dt  = datetime.fromisoformat(str(s["created_at"])) if s.get("created_at") else None
+            dur = s.get("duration_seconds", 0)
+            overall = s.get("overall_score", 0.0) or 0.0
+            detail  = self._store.session_detail(s["id"]) if s.get("id") else {}
+            dims    = {a["dimension"]: a["score"] for a in detail.get("analytics", [])}
+            best    = max(dims, key=dims.get, default=None) if dims else None
+            worst   = min(dims, key=dims.get, default=None) if dims else None
+            for col, val in enumerate([
+                dt.strftime("%Y-%m-%d %H:%M") if dt else "—",
+                f"{int(dur//60)}m {int(dur%60)}s",
+                str(s.get("word_count", 0)),
+                f"{s.get('speaking_rate_wpm', 0.0):.0f}",
+                f"{overall:.0f}",
+                best or "—",
+                worst or "—",
+            ]):
+                self._history_table.setItem(row, col, QTableWidgetItem(val))
+        self._trend_dashboard.refresh()
 
-        self.profile_pattern.setText(
-            profile.notable_pattern
-        )
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _update_session_count(self):
+        self._session_count_label.setText(self._session_count_text())
+
+    def _session_count_text(self):
+        n = self._store.session_count()
+        return f"{n} session{'s' if n != 1 else ''} recorded"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _hdr(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setObjectName("SectionHeader")
+    return lbl
+
+
+def _infobox(title: str, value: str) -> QGroupBox:
+    box = QGroupBox(title)
+    lay = QVBoxLayout(box)
+    val = QLabel(value)
+    val.setObjectName("InfoValue")
+    val.setWordWrap(True)
+    val.setStyleSheet("font-size:13px;")
+    lay.addWidget(val)
+    return box

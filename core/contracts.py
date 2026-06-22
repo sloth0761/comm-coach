@@ -58,12 +58,25 @@ class Segment:
 
 
 @dataclass(frozen=True)
+class Word:
+    """Word-level timestamp from Whisper (v1.5)."""
+    word:        str
+    start:       float
+    end:         float
+    probability: float   # [0, 1]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "probability", max(0.0, min(1.0, self.probability)))
+
+
+@dataclass(frozen=True)
 class TranscriptionResult:
     """Stage 2 output. Errors are preserved — no autocorrection."""
     text: str
     segments: tuple[Segment, ...]
     word_count: int
     speaking_rate_wpm: float
+    words: tuple["Word", ...] = ()   # v1.5 — empty on v1 sessions
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +149,7 @@ class CommunicationProfile:
     trends: dict[str, str]
     persistent_fillers: tuple[dict, ...]
     notable_pattern: str
+    narrative: str = ""   # v1.5 — LLM-generated paragraphs
 
 
 # ---------------------------------------------------------------------------

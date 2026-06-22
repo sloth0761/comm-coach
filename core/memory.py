@@ -8,7 +8,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class MemoryStore:
@@ -124,6 +124,27 @@ class MemoryStore:
                 );
 
 
+                -- ── Word/segment level transcript data — v1.5 ──────────
+                CREATE TABLE IF NOT EXISTS session_segments (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    seq         INTEGER NOT NULL,
+                    start       REAL    NOT NULL,
+                    end         REAL    NOT NULL,
+                    text        TEXT    NOT NULL,
+                    confidence  REAL    NOT NULL CHECK (confidence BETWEEN 0 AND 1)
+                );
+                CREATE TABLE IF NOT EXISTS session_words (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    seq         INTEGER NOT NULL,
+                    word        TEXT    NOT NULL,
+                    start       REAL    NOT NULL,
+                    end         REAL    NOT NULL,
+                    probability REAL    NOT NULL CHECK (probability BETWEEN 0 AND 1)
+                );
+
+
                 -- ── Indexes ───────────────────────────────────────────
                 CREATE INDEX IF NOT EXISTS idx_sessions_created
                     ON sessions(created_at DESC);
@@ -143,6 +164,12 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_insights_session
                     ON session_insights(session_id);
 
+                CREATE INDEX IF NOT EXISTS idx_segments_session
+                    ON session_segments(session_id);
+
+                CREATE INDEX IF NOT EXISTS idx_words_session
+                    ON session_words(session_id);
+
             """)
 
     def upgrade_schema(self) -> None:
@@ -156,8 +183,31 @@ class MemoryStore:
         ).fetchone()
         current = int(row["value"]) if row else 0
 
+        if current < 2:
+            with self._conn:
+                self._conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS session_segments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        seq INTEGER NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
+                        text TEXT NOT NULL, confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1)
+                    );
+                    CREATE TABLE IF NOT EXISTS session_words (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        seq INTEGER NOT NULL, word TEXT NOT NULL,
+                        start REAL NOT NULL, end REAL NOT NULL,
+                        probability REAL NOT NULL CHECK (probability BETWEEN 0 AND 1)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_segments_session ON session_segments(session_id);
+                    CREATE INDEX IF NOT EXISTS idx_words_session ON session_words(session_id);
+                    UPDATE meta SET value = '2' WHERE key = 'schema_version';
+                """)
+            current = 2
+            logger.info("Schema migrated to version 2 (session_segments, session_words)")
+
         # Future migrations slot in here as:
-        #   if current < 2: ...apply migration... current = 2
+        #   if current < 3: ...apply migration... current = 3
         # For now, just ensure the stored version is current.
         if current < SCHEMA_VERSION:
             with self._conn:
@@ -246,6 +296,20 @@ class MemoryStore:
                             for insight in dim.insights
                         ],
                     )
+
+            # 3. Word/segment level transcript data — v1.5
+            _segs = getattr(transcription, "segments", ())
+            if _segs:
+                self._conn.executemany(
+                    "INSERT INTO session_segments (session_id,seq,start,end,text,confidence) VALUES (?,?,?,?,?,?)",
+                    [(session_id, i, s.start, s.end, s.text, s.confidence) for i, s in enumerate(_segs)],
+                )
+            _words = getattr(transcription, "words", ())
+            if _words:
+                self._conn.executemany(
+                    "INSERT INTO session_words (session_id,seq,word,start,end,probability) VALUES (?,?,?,?,?,?)",
+                    [(session_id, i, w.word, w.start, w.end, w.probability) for i, w in enumerate(_words)],
+                )
 
         logger.debug(
             "Saved session %s (overall %.1f, %s words)",
@@ -349,9 +413,10 @@ class MemoryStore:
 
         return {
             **dict(session),
-            "analytics": [dict(r) for r in analytics_rows],
-            "fillers":   [dict(r) for r in filler_rows],
-            "insights":  [dict(r) for r in insight_rows],
+            "analytics":     [dict(r) for r in analytics_rows],
+            "fillers":       [dict(r) for r in filler_rows],          # v1 compat
+            "filler_events": {r["word"]: r["count"] for r in filler_rows},  # v1.5
+            "insights":      [dict(r) for r in insight_rows],
         }
 
     def dimension_series(self, dimension: str, limit: int = 10) -> list[float]:
@@ -410,6 +475,42 @@ class MemoryStore:
             """,
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def save_embedding(self, session_id: int, embedding, model: str) -> None:
+        import numpy as np
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO session_embeddings (session_id,embedding,model) VALUES (?,?,?)",
+                (session_id, embedding.astype(np.float32).tobytes(), model),
+            )
+
+    def session_segments(self, session_id: int) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM session_segments WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def session_words(self, session_id: int) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM session_words WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_embeddings(self) -> list[dict]:
+        import numpy as np
+        rows = self._conn.execute(
+            "SELECT session_id, embedding, model FROM session_embeddings"
+        ).fetchall()
+        result = []
+        for r in rows:
+            try:
+                arr = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+                result.append({"session_id": r["session_id"], "embedding": arr, "model": r["model"]})
+            except Exception as exc:
+                logger.warning("Corrupt embedding session %d: %s", r["session_id"], exc)
+        return result
 
     def close(self) -> None:
         self._conn.close()

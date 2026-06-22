@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import unittest
 from datetime import datetime
 
@@ -15,13 +14,11 @@ os.environ.setdefault(
     "offscreen",
 )
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QTabWidget, QStatusBar, QFrame
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtWidgets import QApplication
 from PyQt6.QtTest import QSignalSpy
 
 from ui.theme import score_colour
-from ui.widgets import PipelineWorker
-from ui.app import MainWindow
+from ui.app import MainWindow, PipelineWorker
 
 from core.contracts import (
     RecordingResult,
@@ -192,6 +189,9 @@ class FakePipeline:
     def __init__(self):
         self._on_stage = lambda _: None
 
+    def set_on_stage(self, callback):
+        self._on_stage = callback
+
     def run(self, recording):
 
         from core.pipeline import PipelineStage
@@ -207,18 +207,24 @@ class FailingPipeline:
     def __init__(self):
         self._on_stage = lambda _: None
 
+    def set_on_stage(self, callback):
+        self._on_stage = callback
+
     def run(self, recording):
         raise RuntimeError("boom")
 
 
 # ---------------------------------------------------------
-# Fake Recorder
+# Fake Recorder — patched onto core.recorder.AudioRecorder
 # ---------------------------------------------------------
 
 
-class FakeRecorder:
+class FakeAudioRecorder:
 
     elapsed_seconds = 0
+
+    def __init__(self, output_dir):
+        pass
 
     def start(self):
         return None
@@ -242,6 +248,15 @@ class FakeStore:
 
     def session_detail(self, session_id):
         return {}
+
+    def session_words(self, session_id):
+        return []
+
+    def session_segments(self, session_id):
+        return []
+
+    def dimension_series(self, dimension, limit=10):
+        return []
 
 
 # ---------------------------------------------------------
@@ -325,40 +340,73 @@ class MainWindowTests(unittest.TestCase):
 
         window = MainWindow(
             pipeline=FakePipeline(),
-            recorder=FakeRecorder(),
             store=FakeStore(),
         )
 
         self.assertIsNotNone(
-            window.session_count_label
+            window._session_count_label
         )
 
         self.assertEqual(
-            window.tabs.count(),
-            8,
+            window._tabs.count(),
+            9,
         )
 
     def test_state_machine(self):
 
-        window = MainWindow(
-            pipeline=FakePipeline(),
-            recorder=FakeRecorder(),
-            store=FakeStore(),
-        )
+        import core.recorder as recorder_module
+        original_recorder_cls = recorder_module.AudioRecorder
+        recorder_module.AudioRecorder = FakeAudioRecorder
 
-        window.start_recording()
+        try:
+            window = MainWindow(
+                pipeline=FakePipeline(),
+                store=FakeStore(),
+            )
 
-        self.assertEqual(
-            window.state,
-            "recording",
-        )
+            window.start_recording()
 
-        window.set_idle_state()
+            self.assertEqual(
+                window._record_stack.currentIndex(),
+                1,
+            )
 
-        self.assertEqual(
-            window.state,
-            "idle",
-        )
+            # Manual reset mirrors what _on_failed / _on_finished do
+            # synchronously — avoids depending on cross-thread Qt signal
+            # delivery inside a unit test.
+            window._on_failed("reset for test")
+
+            self.assertEqual(
+                window._record_stack.currentIndex(),
+                0,
+            )
+        finally:
+            recorder_module.AudioRecorder = original_recorder_cls
+
+    def test_stop_recording_starts_pipeline(self):
+
+        import core.recorder as recorder_module
+        original_recorder_cls = recorder_module.AudioRecorder
+        recorder_module.AudioRecorder = FakeAudioRecorder
+
+        try:
+            window = MainWindow(
+                pipeline=FakePipeline(),
+                store=FakeStore(),
+            )
+
+            window.start_recording()
+            window.stop_recording()
+
+            self.assertEqual(
+                window._record_stack.currentIndex(),
+                2,
+            )
+
+            self.assertIsNotNone(window._worker)
+            self.assertTrue(window._worker.wait(5000))
+        finally:
+            recorder_module.AudioRecorder = original_recorder_cls
 
 
 class HistoryShapeTests(unittest.TestCase):

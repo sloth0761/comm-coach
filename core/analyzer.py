@@ -78,6 +78,10 @@ class Coach(ABC):
         context: MemoryContext,
     ) -> CoachingResult: ...
 
+    def generate_narrative(self, profile) -> str:
+        """Returns '' by default. LocalLLMCoach overrides."""
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # DummyCoach — deterministic, no LLM
@@ -126,6 +130,9 @@ class DummyCoach(Coach):
             next_focus=weakest.feedback,
             raw_json=raw,
         )
+
+    def generate_narrative(self, profile) -> str:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +215,48 @@ class LocalLLMCoach(Coach):
                 del llm
                 gc.collect()
                 logger.info("SmolLM2 freed.")
+
+    def generate_narrative(self, profile) -> str:
+        from llama_cpp import Llama
+        _SYSTEM = (
+            "You are a communication coach. Write 2-3 paragraphs in second person "
+            "summarising this speaker's communication identity. Be specific and honest. "
+            "Plain paragraphs only — no bullets, no headers."
+        )
+
+        def _prompt(p) -> str:
+            parts = []
+            if p.strengths:
+                parts.append(f"Consistent strengths: {', '.join(p.strengths)}")
+            if p.recurring_weaknesses:
+                parts.append(f"Recurring challenges: {', '.join(p.recurring_weaknesses)}")
+            improving = [d for d, t in p.trends.items() if t == "improving"]
+            if improving:
+                parts.append(f"Improving: {', '.join(improving)}")
+            if p.persistent_fillers:
+                filler_words = ", ".join(f["word"] for f in p.persistent_fillers[:3])
+                parts.append(f"Persistent fillers: {filler_words}")
+            if p.notable_pattern:
+                parts.append(f"Notable: {p.notable_pattern}")
+            return "\n".join(parts)
+
+        llm = None
+        try:
+            llm = Llama(model_path=self._model_path, n_ctx=2048,
+                        n_threads=os.cpu_count() or 4, verbose=False)
+            resp = llm.create_chat_completion(
+                messages=[{"role": "system", "content": _SYSTEM},
+                          {"role": "user",   "content": _prompt(profile)}],
+                temperature=0.5, max_tokens=400,
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            logger.warning("Narrative generation failed (%s).", exc)
+            return ""
+        finally:
+            if llm is not None:
+                del llm
+                gc.collect()
 
 
 # ---------------------------------------------------------------------------

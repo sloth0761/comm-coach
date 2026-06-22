@@ -14,7 +14,7 @@ import gc
 import logging
 from abc import ABC, abstractmethod
 
-from core.contracts import RecordingResult, Segment, TranscriptionResult
+from core.contracts import RecordingResult, Segment, TranscriptionResult, Word
 
 logger = logging.getLogger(__name__)
 
@@ -77,23 +77,35 @@ class LocalWhisperTranscriber(Transcriber):
             raw_segments, _info = model.transcribe(
                 recording.wav_path,
                 beam_size=5,
-                language=None,       # auto-detect
-                vad_filter=True,     # suppress hallucinations on silence
+                language=None,        # auto-detect
+                vad_filter=True,      # suppress hallucinations on silence
+                word_timestamps=True, # v1.5
             )
 
             # ── MATERIALISE THE GENERATOR NOW ───────────────────────────
-            # Do not move this tuple() call below the `finally` block.
-            segments: tuple[Segment, ...] = tuple(
-                Segment(
-                    start=seg.start,
-                    end=seg.end,
-                    text=seg.text,
-                    # Normalise avg_logprob to [0, 1].
-                    # Segment.__post_init__ clamps the result.
-                    confidence=1.0 + seg.avg_logprob / 5.0,
-                )
-                for seg in raw_segments
-            )
+            # Do not move this loop below the `finally` block.
+            segments_list: list[Segment] = []
+            words_list:    list[Word]    = []
+            text_parts:    list[str]     = []
+
+            for seg in raw_segments:
+                # Normalise avg_logprob to [0, 1].
+                # Segment.__post_init__ clamps the result.
+                confidence = 1.0 + seg.avg_logprob / 5.0
+                segments_list.append(Segment(
+                    start=seg.start, end=seg.end,
+                    text=seg.text, confidence=confidence,
+                ))
+                text_parts.append(seg.text)
+                if seg.words:
+                    for w in seg.words:
+                        words_list.append(Word(
+                            word=w.word, start=w.start,
+                            end=w.end, probability=w.probability,
+                        ))
+
+            segments: tuple[Segment, ...] = tuple(segments_list)
+            words:    tuple[Word, ...]    = tuple(words_list)
 
         except TranscriptionError:
             raise
@@ -107,7 +119,7 @@ class LocalWhisperTranscriber(Transcriber):
             logger.info("Whisper model freed.")
 
         # Build the flat transcript from materialised segments
-        full_text  = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+        full_text  = "".join(text_parts).strip()
         word_count = len(full_text.split()) if full_text else 0
         wpm        = (
             round(word_count / recording.duration_seconds * 60, 1)
@@ -124,6 +136,7 @@ class LocalWhisperTranscriber(Transcriber):
             segments=segments,
             word_count=word_count,
             speaking_rate_wpm=wpm,
+            words=words,
         )
 
 

@@ -7,6 +7,9 @@ Subsequent runs use the cache and are fast.
 """
 from __future__ import annotations
 
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # see main.py — OMP runtime clash
+
 import gc
 import sys
 import tempfile

@@ -1,1 +1,8 @@
 PyQt6==6.6.1
+matplotlib>=3.8.0
+
+# sentence-transformers>=4.x pulls in a transformers version that requires
+# torch>=2.4, which has no Intel-macOS wheel (torch is capped at 2.2.2 there).
+# Pin below that line so `pip install` stays reproducible on Intel Macs.
+sentence-transformers>=2.7.0,<4.0
+numpy<2   # match the NumPy 1.x ABI the pinned torch build was compiled against

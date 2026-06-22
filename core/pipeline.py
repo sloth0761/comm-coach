@@ -27,6 +27,7 @@ class PipelineStage(enum.Enum):
     ASSEMBLING_MEMORY = "Assembling memory"
     COACHING          = "Coaching"
     SAVING            = "Saving"
+    EMBEDDING         = "Embedding"
     DONE              = "Done"
 
 
@@ -54,13 +55,18 @@ class SessionPipeline:
         coach,
         store: MemoryStore,
         engine: MemoryEngine,
+        embedder=None,
         on_stage: Callable[[PipelineStage], None] = lambda _: None,
     ) -> None:
         self._transcriber = transcriber
         self._coach       = coach
         self._store       = store
         self._engine      = engine
+        self._embedder    = embedder
         self._on_stage    = on_stage
+
+    def set_on_stage(self, callback: Callable[[PipelineStage], None]) -> None:
+        self._on_stage = callback
 
     def run(self, recording: RecordingResult) -> SessionResult:
         """
@@ -94,7 +100,9 @@ class SessionPipeline:
         # ── Stage 4a — Memory assembly ────────────────────────────────────
         self._on_stage(PipelineStage.ASSEMBLING_MEMORY)
         logger.info("Stage 4a: assembling memory context")
-        context = self._engine.assemble_context(analytics, transcription.text)
+        context = self._engine.assemble_context(
+            analytics, transcription.text, embedder=self._embedder
+        )
 
         # ── Stage 4b — Coaching ───────────────────────────────────────────
         self._on_stage(PipelineStage.COACHING)
@@ -111,7 +119,26 @@ class SessionPipeline:
         self._on_stage(PipelineStage.SAVING)
         logger.info("Stage 5: saving session")
         session_id = self._store.save_session(recording, transcription, analytics, coaching)
-        profile    = self._engine.generate_profile()
+
+        # ── Stage 5b — embed (optional, non-blocking) ──────────────────────
+        if self._embedder is not None:
+            self._on_stage(PipelineStage.EMBEDDING)
+            try:
+                vec = self._embedder.embed(transcription.text)
+                self._store.save_embedding(session_id, vec, self._embedder.model_name)
+            except Exception as exc:
+                logger.warning("Embedding failed (%s). Skipping.", exc)
+
+        profile = self._engine.generate_profile()
+
+        # ── Stage 5d — narrative (optional second LLM load) ────────────────
+        from dataclasses import replace as _replace
+        try:
+            narrative = self._coach.generate_narrative(profile)
+            if narrative:
+                profile = _replace(profile, narrative=narrative)
+        except Exception as exc:
+            logger.warning("Narrative error (%s). Skipping.", exc)
 
         self._on_stage(PipelineStage.DONE)
         logger.info("Pipeline complete. session_id=%d", session_id)

@@ -101,24 +101,28 @@ QLabel#TagLabel {
     padding: 4px 10px;
 }
 
+QWidget#Header {
+    background: #1565C0;
+}
+
+QWidget#RecordBar {
+    background: #fff;
+    border-bottom: 1px solid #E0E0E0;
+}
+
 QPushButton#RecordButton {
-    min-width: 140px;
-    max-width: 140px;
-    min-height: 140px;
-    max-height: 140px;
-    border-radius: 70px;
-    font-size: 20px;
+    min-width: 200px;
+    min-height: 44px;
+    padding: 8px 24px;
+    border-radius: 22px;
+    font-size: 15px;
     font-weight: bold;
     background: #607D8B;
     color: white;
 }
 
-QPushButton#RecordButton[recording="true"] {
-    background: #F44336;
-}
-
-QPushButton#RecordButton[processing="true"] {
-    background: #9E9E9E;
+QPushButton#RecordButton:hover {
+    background: #546E7A;
 }
 
 QTableWidget {
@@ -129,5 +133,20 @@ QTableWidget {
 QHeaderView::section {
     background: #F0F0F0;
     font-weight: bold;
+}
+
+QTextEdit#TranscriptEdit {
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    line-height: 1.8;
+    padding: 8px;
+}
+
+QLabel#ProfileNarrative {
+    border-left: 3px solid #607D8B;
+    padding-left: 10px;
+    font-size: 13px;
+    color: #37474F;
+    line-height: 1.6;
 }
 """
